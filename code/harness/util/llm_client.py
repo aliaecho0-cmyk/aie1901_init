@@ -1,0 +1,173 @@
+from __future__ import annotations
+
+import json
+import os
+import time
+import logging
+from dataclasses import dataclass, field, asdict
+from typing import Any, Optional
+
+from openai import OpenAI, APIError, RateLimitError, APIConnectionError, APITimeoutError
+
+log = logging.getLogger(__name__)
+
+
+DEFAULT_ENDPOINT = "https://api.openai.com/v1"
+DEFAULT_DEPLOYMENT = "gpt-5.4-mini"
+
+PRICE_INPUT_PER_1M = float(
+    os.getenv("OPENAI_PRICE_INPUT_PER_1M")
+    or os.getenv("AZURE_PRICE_INPUT_PER_1M", "0.25")
+)
+PRICE_OUTPUT_PER_1M = float(
+    os.getenv("OPENAI_PRICE_OUTPUT_PER_1M")
+    or os.getenv("AZURE_PRICE_OUTPUT_PER_1M", "2.00")
+)
+
+
+@dataclass
+class CallResult:
+    ok: bool
+    text: str = ""
+    finish_reason: Optional[str] = None
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    cost_usd: float = 0.0
+    latency_s: float = 0.0
+    attempts: int = 1
+    error: Optional[str] = None
+    raw: Optional[dict] = None
+
+    def to_dict(self) -> dict:
+        d = asdict(self)
+        d.pop("raw", None)
+        return d
+
+
+class LLMClient:
+
+    def __init__(
+        self,
+        endpoint: Optional[str] = None,
+        api_key: Optional[str] = None,
+        deployment: Optional[str] = None,
+        timeout: float = 60.0,
+        max_retries: int = 3,
+        verbose: bool = True,
+    ):
+        self.endpoint = (
+            endpoint
+            or os.getenv("OPENAI_BASE_URL")
+            or os.getenv("AZURE_OPENAI_ENDPOINT")
+            or DEFAULT_ENDPOINT
+        ).rstrip("/")
+        self.api_key = (
+            api_key
+            or os.getenv("OPENAI_API_KEY")
+            or os.getenv("AZURE_OPENAI_API_KEY")
+        )
+        if not self.api_key:
+            raise RuntimeError("OPENAI_API_KEY env var or api_key arg required.")
+        self.deployment = (
+            deployment
+            or os.getenv("OPENAI_MODEL")
+            or os.getenv("AZURE_OPENAI_DEPLOYMENT")
+            or DEFAULT_DEPLOYMENT
+        )
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.verbose = verbose
+
+        self._client = OpenAI(
+            base_url=self.endpoint,
+            api_key=self.api_key,
+            timeout=timeout,
+            max_retries=0,
+        )
+
+    @staticmethod
+    def _estimate_cost(in_tokens: int, out_tokens: int) -> float:
+        return (in_tokens / 1_000_000.0) * PRICE_INPUT_PER_1M + (
+            out_tokens / 1_000_000.0
+        ) * PRICE_OUTPUT_PER_1M
+
+    def chat(
+        self,
+        messages: list[dict],
+        max_completion_tokens: int = 256,
+        temperature: Optional[float] = None,
+        response_format: Optional[dict] = None,
+        seed: Optional[int] = None,
+        extra: Optional[dict] = None,
+    ) -> CallResult:
+        params: dict[str, Any] = {
+            "model": self.deployment,
+            "messages": messages,
+            "max_tokens": max_completion_tokens,
+        }
+        if temperature is not None:
+            params["temperature"] = temperature
+        if response_format is not None:
+            params["response_format"] = response_format
+        if seed is not None:
+            params["seed"] = seed
+        if extra:
+            params.update(extra)
+
+        attempt = 0
+        last_err: Optional[str] = None
+        t0 = time.monotonic()
+        while attempt < self.max_retries:
+            attempt += 1
+            try:
+                if self.verbose:
+                    print(f"\n================ 🚀 发动真实请求 ================")
+                    print(f"URL: {self.endpoint}")
+                    print(f"Model: {self.deployment}")
+                    print(f"Params: {params}")
+                    print(f"=================================================\n")
+                resp = self._client.chat.completions.create(**params)
+                latency = time.monotonic() - t0
+                choice = resp.choices[0]
+                txt = choice.message.content or ""
+                usage = resp.usage
+                in_t = getattr(usage, "prompt_tokens", 0) or 0
+                out_t = getattr(usage, "completion_tokens", 0) or 0
+                tot_t = getattr(usage, "total_tokens", in_t + out_t) or (in_t + out_t)
+                return CallResult(
+                    ok=True,
+                    text=txt,
+                    finish_reason=choice.finish_reason,
+                    prompt_tokens=in_t,
+                    completion_tokens=out_t,
+                    total_tokens=tot_t,
+                    cost_usd=self._estimate_cost(in_t, out_t),
+                    latency_s=latency,
+                    attempts=attempt,
+                    raw=None,
+                )
+            except (RateLimitError, APIConnectionError, APITimeoutError) as e:
+                last_err = f"{type(e).__name__}: {e}"
+                log.warning("chat retry %d/%d: %s", attempt, self.max_retries, last_err)
+                time.sleep(min(2 ** attempt, 8))
+            except APIError as e:
+                raise e
+                last_err = f"{type(e).__name__}: {e}"
+                log.warning("chat APIError attempt %d: %s", attempt, last_err)
+                time.sleep(min(2 ** attempt, 8))
+            except Exception as e:
+                raise e
+                last_err = f"{type(e).__name__}: {e}"
+                log.exception("chat unexpected error")
+                time.sleep(min(2 ** attempt, 8))
+        return CallResult(
+            ok=False,
+            error=last_err,
+            latency_s=time.monotonic() - t0,
+            attempts=attempt,
+        )
+
+
+def get_default_client() -> LLMClient:
+    return LLMClient()
