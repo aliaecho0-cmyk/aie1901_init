@@ -28,11 +28,14 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "code"))
+TAU2_SOURCE = ROOT.parent / "tau2-bench" / "src"
+if TAU2_SOURCE.is_dir():
+    sys.path.insert(1, str(TAU2_SOURCE))
 
 try:  # optional: pick up .env if the user has one
     from dotenv import load_dotenv
 
-    load_dotenv(ROOT / ".env")
+    load_dotenv(ROOT / ".env", override=True)
 except ImportError:
     pass
 
@@ -93,6 +96,8 @@ def run_one(
     client: LLMClient,
     *,
     max_steps: int,
+    temperature: float,
+    prompt_variant: str,
 ) -> tuple[Any, Any, dict]:
     """Run one task in a clean environment and return (logger, task, entry)."""
     task = load_real_task(task_dir)
@@ -104,6 +109,7 @@ def run_one(
     t0 = time.monotonic()
     logger, _ = run_real_episode(
         task, client=client, env=env, max_steps_override=max_steps,
+        temperature=temperature, prompt_variant=prompt_variant,
     )
     elapsed = time.monotonic() - t0
 
@@ -149,11 +155,16 @@ def run_with_retries(
     *,
     max_steps: int,
     retries: int,
+    temperature: float,
+    prompt_variant: str,
 ) -> tuple[Any, Any, dict]:
     """Retry an episode only when it died on a transport-level LLM error."""
     last: tuple[Any, Any, dict] | None = None
     for attempt in range(retries + 1):
-        logger, task, entry = run_one(task_dir, client, max_steps=max_steps)
+        logger, task, entry = run_one(
+            task_dir, client, max_steps=max_steps, temperature=temperature,
+            prompt_variant=prompt_variant,
+        )
         entry["attempts"] = attempt + 1
         last = (logger, task, entry)
         if entry["termination_reason"] != "llm_error":
@@ -234,14 +245,17 @@ def build_summary(
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
+def main(*, temperature: float = 0.0,
+         default_out_dir: Path = DEFAULT_OUT_DIR,
+         prompt_variant: str = "baseline",
+         description: str | None = None) -> None:
+    parser = argparse.ArgumentParser(description=description or __doc__)
     parser.add_argument("--limit", type=int, default=None,
                         help="run only the first N tasks")
     parser.add_argument("--start", type=int, default=0,
                         help="skip the first N tasks")
     parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
-    parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
+    parser.add_argument("--out-dir", type=Path, default=default_out_dir)
     parser.add_argument("--max-steps", type=int, default=15)
     parser.add_argument("--task-retries", type=int, default=1,
                         help="retries when an episode ends on an LLM error")
@@ -284,6 +298,8 @@ def main() -> None:
         "task_retries": args.task_retries,
         "model": client.deployment,
         "endpoint": client.endpoint,
+        "temperature": temperature,
+        "prompt_variant": prompt_variant,
     }
 
     started_at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
@@ -296,6 +312,8 @@ def main() -> None:
     print(f"data:  {data_root}")
     print(f"out:   {out_dir}")
     print(f"model: {client.deployment} @ {client.endpoint}")
+    print(f"temperature: {temperature}")
+    print(f"prompt variant: {prompt_variant}")
     print("=" * 78, flush=True)
 
     try:
@@ -306,6 +324,8 @@ def main() -> None:
                     task_dir, client,
                     max_steps=args.max_steps,
                     retries=args.task_retries,
+                    temperature=temperature,
+                    prompt_variant=prompt_variant,
                 )
                 traj_path = logger.to_jsonl(traj_dir / f"{task.task_id}.jsonl")
                 entry["trajectory_file"] = _rel(traj_path)

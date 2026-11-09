@@ -5,9 +5,17 @@ import os
 import time
 import logging
 from dataclasses import dataclass, field, asdict
+from pathlib import Path
 from typing import Any, Optional
 
 from openai import OpenAI, APIError, RateLimitError, APIConnectionError, APITimeoutError
+
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(Path(__file__).resolve().parents[3] / ".env", override=True)
+except ImportError:
+    pass
 
 log = logging.getLogger(__name__)
 

@@ -147,11 +147,12 @@ def _render_trace(trace: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _real_system_prompt(env, max_steps: int) -> str:
+def _real_system_prompt(env, max_steps: int,
+                        prompt_variant: str = "baseline") -> str:
     from .tau2_adapter import render_tool_catalog, tool_catalog
 
     catalog = tool_catalog(env)
-    return f"""You are a customer-service agent for an online retail store.
+    prompt = f"""You are a customer-service agent for an online retail store.
 
 ## Store policy
 {env.get_policy()}
@@ -191,6 +192,21 @@ Complete the request in this single episode.
   has actually been applied. Never use `submit` to ask a question or request
   confirmation.
 """
+    if prompt_variant == "checklist":
+        prompt += """
+
+## Execution checklist
+1. Before a write, use the read tools to confirm the exact target record and
+   the fields needed for the requested change.
+2. Perform only the write operation needed to fulfill the customer request.
+3. Inspect each write result. If it reports an error or does not confirm the
+   requested change, resolve that before continuing.
+4. Submit only after the tool results confirm that the requested change is
+   complete.
+"""
+    elif prompt_variant != "baseline":
+        raise ValueError(f"unsupported prompt variant: {prompt_variant}")
+    return prompt
 
 
 def _real_user_prompt(task: Task, trace: list[dict], step: int,
@@ -236,6 +252,8 @@ def run_real_episode(
     client: LLMClient | None = None,
     env=None,
     max_steps_override: int | None = None,
+    temperature: float = 0.0,
+    prompt_variant: str = "baseline",
 ) -> tuple[TrajectoryLogger, dict]:
     """3-action dynamic loop against the real tau2 retail environment.
 
@@ -261,7 +279,7 @@ def run_real_episode(
         n_criteria=n_criteria,
     )
 
-    system_prompt = _real_system_prompt(env, max_steps)
+    system_prompt = _real_system_prompt(env, max_steps, prompt_variant)
     messages: list = [UserMessage(role="user", content=task_brief(task))]
     trace: list[dict] = []
     termination = "max_steps"
@@ -285,7 +303,7 @@ def run_real_episode(
                  "content": _real_user_prompt(task, trace, step, max_steps)},
             ],
             max_completion_tokens=700,
-            temperature=0.0,
+            temperature=temperature,
         )
         if not res.ok:
             logger.log_step(
